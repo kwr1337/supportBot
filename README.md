@@ -86,7 +86,7 @@ TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 # Bitrix24 Configuration  
 BITRIX24_DOMAIN=company.bitrix24.ru
 BITRIX24_ACCESS_TOKEN=your_access_token
-BITRIX24_USER_ID=1269
+BITRIX24_USER_ID=1234
 
 # Database
 DATABASE_URL=sqlite:///./support_bot.db
@@ -177,7 +177,7 @@ python main.py
 ## 🔄 **Логика назначения**
 
 ### **Постановщик задач:**
-- **Всегда:** ТехАккаунт (Bitrix24 ID: 1269)
+- **Всегда:** ТехАккаунт (Bitrix24 ID: 1234)
 
 ### **Исполнители:**
 - **Клиент создает** → ТехАккаунт
