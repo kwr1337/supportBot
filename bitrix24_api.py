@@ -63,7 +63,7 @@ class Bitrix24API:
             raise
     
     def create_task(self, title: str, description: str, task_type: TaskType, 
-                   responsible_user_id: Optional[int] = None) -> Dict[str, Any]:
+                   responsible_user_id: Optional[int] = None, co_executors: Optional[List[int]] = None) -> Dict[str, Any]:
         """Создание задачи в Bitrix24"""
         
         # Определяем приоритет по типу задачи
@@ -89,6 +89,11 @@ class Bitrix24API:
             "fields[CREATED_BY]": creator_id,
             "fields[RESPONSIBLE_ID]": responsible_id,
         }
+        
+        # Добавляем соисполнителей если указаны
+        if co_executors:
+            for i, co_executor_id in enumerate(co_executors):
+                task_data[f"fields[ACCOMPLICES][{i}]"] = co_executor_id
         
         result = self._make_request("POST", "tasks.task.add", task_data)
         logger.info(f"Создана задача в Bitrix24 с ID: {result.get('task', {}).get('id')}")
@@ -425,6 +430,100 @@ class Bitrix24API:
         except Exception as e:
             logger.error(f"Ошибка поиска пользователей: {e}")
             return []
+    
+    def get_user_by_telegram_id(self, telegram_id: str) -> Optional[Dict[str, Any]]:
+        """Поиск пользователя по Telegram ID в поле tgID"""
+        try:
+            # Получаем всех пользователей и ищем среди них
+            all_users = self.get_users()
+            
+            # Список возможных полей для Telegram ID
+            possible_fields = ["UF_TELEGRAM_ID", "UF_TG_ID", "UF_TGID", "tgID", "UF_USR_1755866403098"]
+            
+            for user in all_users:
+                for field in possible_fields:
+                    field_value = user.get(field, "")
+                    # Проверяем точное совпадение как строки
+                    if str(field_value).strip() == str(telegram_id).strip():
+                        logger.info(f"Найден пользователь по полю {field}: {user.get('NAME')} {user.get('LAST_NAME')} (ID: {user.get('ID')})")
+                        return user
+            
+            logger.info(f"Пользователь с Telegram ID {telegram_id} не найден")
+            return None
+                
+        except Exception as e:
+            logger.error(f"Ошибка поиска пользователя по Telegram ID: {e}")
+            return None
+    
+    def update_user_telegram_id(self, user_id: int, telegram_id: str) -> bool:
+        """Обновление поля tgID пользователя в Битрикс24"""
+        try:
+            # Пробуем разные возможные названия поля для Telegram ID
+            fields_to_try = ["UF_TELEGRAM_ID", "UF_TG_ID", "UF_TGID"]
+            
+            for field in fields_to_try:
+                try:
+                    data = {
+                        "ID": user_id,
+                        f"fields[{field}]": telegram_id
+                    }
+                    
+                    result = self._make_request("POST", "user.update", data)
+                    
+                    if result:
+                        logger.info(f"Обновлен Telegram ID для пользователя {user_id}: {telegram_id} (поле: {field})")
+                        return True
+                        
+                except Exception as field_error:
+                    logger.warning(f"Не удалось обновить поле {field}: {field_error}")
+                    continue
+            
+            logger.error(f"Не удалось найти подходящее поле для Telegram ID у пользователя {user_id}")
+            return False
+                
+        except Exception as e:
+            logger.error(f"Ошибка обновления Telegram ID пользователя: {e}")
+            return False
+    
+    def get_users_with_telegram_ids(self) -> List[Dict[str, Any]]:
+        """Получение всех пользователей, у которых заполнено поле tgID"""
+        try:
+            all_users = self.get_users()
+            users_with_tg = []
+            
+            # Список возможных полей для Telegram ID
+            possible_fields = ["UF_TELEGRAM_ID", "UF_TG_ID", "UF_TGID", "tgID", "UF_USR_1755866403098"]
+            
+            for user in all_users:
+                # Проверяем различные возможные поля для Telegram ID
+                telegram_id = None
+                used_field = None
+                
+                for field in possible_fields:
+                    if field in user and user[field] and str(user[field]).strip():
+                        telegram_id = str(user[field]).strip()
+                        used_field = field
+                        break
+                
+                if telegram_id:
+                    user["TELEGRAM_ID"] = telegram_id  # Нормализуем поле
+                    user["TELEGRAM_FIELD"] = used_field  # Запоминаем, какое поле использовалось
+                    users_with_tg.append(user)
+                    logger.debug(f"Пользователь {user.get('NAME')} {user.get('LAST_NAME')} имеет Telegram ID {telegram_id} в поле {used_field}")
+            
+            logger.info(f"Найдено {len(users_with_tg)} пользователей с Telegram ID")
+            return users_with_tg
+                
+        except Exception as e:
+            logger.error(f"Ошибка получения пользователей с Telegram ID: {e}")
+            return []
+    
+    def find_bitrix_user_by_telegram(self, telegram_id: str) -> Optional[int]:
+        """Поиск Bitrix24 ID пользователя по Telegram ID"""
+        user = self.get_user_by_telegram_id(telegram_id)
+        if user:
+            return int(user.get("ID", 0))
+        return None
 
 
 # Создаем глобальный экземпляр API

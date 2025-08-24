@@ -25,6 +25,7 @@ from auth_decorators import admin_only, client_or_admin, log_user_action
 from models import UserRole
 from project_service import project_service
 from employee_service import employee_service
+from telegram_bitrix_sync_service import telegram_bitrix_sync
 
 # Настройка логирования
 logging.basicConfig(
@@ -36,6 +37,9 @@ logger = logging.getLogger(__name__)
 
 class SupportBot:
     """Основной класс Telegram бота поддержки"""
+    
+    # ID Елены Зубатенко - координатор проектов (всегда соисполнитель)
+    ELENA_ZUBATENKO_ID = 809
     
     def __init__(self):
         self.task_service = TaskService()
@@ -77,8 +81,14 @@ class SupportBot:
 • `/users` \\- Список пользователей
 • `/add_admin` \\- Добавить администратора
 • `/remove_admin` \\- Удалить администратора
-• `/manage_employees` \\- Управление сотрудниками
+• `/manage_employees` \\- Управление сотрудниками \\(старая система\\)
 • `/sync` \\- Синхронизация с Битрикс24
+
+📱 **Управление связыванием Telegram\\-Битрикс24:**
+• `/show_links` \\- Показать все связи
+• `/link_telegram` \\- Связать Bitrix24 ID с Telegram ID
+• `/unlink_telegram` \\- Удалить связь
+• `/sync_bitrix` \\- Синхронизация кеша с Битрикс24
 • `/daily_report` \\- Ежедневный отчет
             """
         
@@ -259,32 +269,44 @@ class SupportBot:
     async def create_bitrix_task_immediately(self, context: ContextTypes.DEFAULT_TYPE, task: Task, original_message):
         """Немедленное создание задачи в Битрикс24 и отправка единого уведомления"""
         try:
-            # Определяем исполнителя задачи
-            creator_user_id = task.telegram_user_id
+            # Новая логика назначения исполнителя:
+            # 1. Если это reply от сотрудника -> исполнитель = этот сотрудник
+            # 2. Иначе -> исполнитель = ТехАккаунт (ID 1269)
             
-            # Проверяем, является ли создатель сотрудником в этом чате
-            creator_bitrix_id = employee_service.get_employee_bitrix_id(task.telegram_chat_id, creator_user_id)
-            
-            # Логика назначения исполнителя:
-            # - Если создатель НЕ является сотрудником проекта -> исполнитель ТехАккаунт (ID 1269)
-            # - Если создатель является сотрудником проекта -> исполнитель сам сотрудник
-            if creator_bitrix_id is None:
-                # Это клиент (не сотрудник проекта)
-                responsible_id = 1269  # ТехАккаунт
-                executor_text = "ТехАккаунт"
-                logger.info(f"Задача от клиента - назначаем ТехАккаунт (ID: 1269)")
+            # Проверяем, есть ли reply_to_message
+            if original_message.reply_to_message:
+                # Это reply - проверяем, кто отвечает
+                replier_user_id = str(original_message.from_user.id)
+                replier_bitrix_id = telegram_bitrix_sync.get_bitrix_user_id(replier_user_id)
+                
+                if replier_bitrix_id:
+                    # Reply от сотрудника - назначаем его исполнителем
+                    responsible_id = replier_bitrix_id
+                    user_info = telegram_bitrix_sync.get_user_info(replier_user_id)
+                    user_name = user_info.get('name', f'ID: {replier_bitrix_id}') if user_info else f'ID: {replier_bitrix_id}'
+                    executor_text = f"сотрудник {user_name} (ID: {replier_bitrix_id})"
+                    logger.info(f"Reply от сотрудника (tgID: {replier_user_id}) - назначаем сотрудника (ID: {responsible_id})")
+                else:
+                    # Reply от клиента - назначаем ТехАккаунт
+                    responsible_id = 1269
+                    executor_text = "ТехАккаунт"
+                    logger.info(f"Reply от клиента (без tgID) - назначаем ТехАккаунт (ID: 1269)")
             else:
-                # Это сотрудник проекта
-                responsible_id = creator_bitrix_id
-                executor_text = f"сотрудник (ID: {creator_bitrix_id})"
-                logger.info(f"Задача от сотрудника - назначаем сотрудника (ID: {responsible_id})")
+                # Обычное упоминание (не reply) - всегда ТехАккаунт
+                responsible_id = 1269
+                executor_text = "ТехАккаунт"
+                logger.info(f"Обычное упоминание - назначаем ТехАккаунт (ID: 1269)")
+            
+            # Елена Зубатенко всегда соисполнитель
+            elena_id = self.ELENA_ZUBATENKO_ID
             
             # Создаем задачу в Битрикс24 с типом "Требование" по умолчанию
             bitrix_result = bitrix24_api.create_task(
                 title=task.title,
                 description=task.description,
                 task_type=TaskType.REQUIREMENT,  # Тип по умолчанию
-                responsible_user_id=responsible_id
+                responsible_user_id=responsible_id,
+                co_executors=[elena_id]  # Елена Зубатенко всегда соисполнитель
             )
             
             # Обновляем задачу в БД
@@ -306,6 +328,7 @@ class SupportBot:
 👤 **Создатель:** {original_message.from_user.first_name}
 🏷️ **Тип:** 📋 Требование (по умолчанию)
 👨‍💼 **Исполнитель:** {executor_text}
+👥 **Соисполнитель:** Елена Зубатенко (координатор проектов)
 🔗 **Bitrix24 ID:** {bitrix_task_id or 'Ошибка создания'}
 ⏰ **Время:** {datetime.now().strftime('%d.%m.%Y %H:%M')}
 
@@ -324,12 +347,16 @@ class SupportBot:
             )
     
     async def get_employee_bitrix_id(self, telegram_user_id: str, telegram_chat_id: str = None) -> Optional[int]:
-        """Получение Bitrix24 ID сотрудника по Telegram ID"""
+        """Получение Bitrix24 ID сотрудника по Telegram ID через новый сервис синхронизации"""
         try:
-            # Сначала проверяем в таблице пользователей
-            user_role = user_management.get_user_role(telegram_user_id)
+            # Используем новый сервис синхронизации для поиска по tgID
+            bitrix_id = telegram_bitrix_sync.get_bitrix_user_id(telegram_user_id)
             
-            # Получаем Bitrix24 ID из профиля пользователя
+            if bitrix_id:
+                logger.debug(f"Найден Bitrix ID {bitrix_id} для Telegram ID {telegram_user_id}")
+                return bitrix_id
+            
+            # Fallback: проверяем старые записи в локальной БД
             db = get_db_session()
             try:
                 from models import BotUser
@@ -338,13 +365,8 @@ class SupportBot:
                 ).first()
                 
                 if bot_user and bot_user.bitrix24_user_id:
+                    logger.debug(f"Найден в локальной БД: Telegram {telegram_user_id} -> Bitrix {bot_user.bitrix24_user_id}")
                     return bot_user.bitrix24_user_id
-                
-                # Если не найдено в профиле, проверяем в сотрудниках чата
-                if telegram_chat_id:
-                    employee_bitrix_id = employee_service.get_employee_bitrix_id(telegram_chat_id, telegram_user_id)
-                    if employee_bitrix_id:
-                        return employee_bitrix_id
                 
                 return None
                 
@@ -456,11 +478,13 @@ class SupportBot:
             task = self.task_service.update_task_type(task_id, task_type)
             
             if task:
-                # Создаем задачу в Bitrix24
+                # Создаем задачу в Bitrix24 с Еленой как соисполнителем
+                elena_id = self.ELENA_ZUBATENKO_ID
                 bitrix_result = bitrix24_api.create_task(
                     title=task.title,
                     description=task.description,
-                    task_type=task_type
+                    task_type=task_type,
+                    co_executors=[elena_id]
                 )
                 
                 # Обновляем ID задачи в Bitrix24
@@ -1948,6 +1972,211 @@ class SupportBot:
             if 'pending_employee' in context.user_data:
                 del context.user_data['pending_employee']
     
+    @admin_only
+    @log_user_action("link_telegram")
+    async def link_telegram_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Связывание Bitrix24 пользователя с Telegram ID через tgID"""
+        if len(context.args) != 2:
+            await update.message.reply_text(
+                "❌ Неверный формат команды.\n"
+                "Используйте: `/link_telegram <Bitrix24_ID> <Telegram_ID>`\n\n"
+                "Например: `/link_telegram 123 608167496`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        try:
+            bitrix_user_id = int(context.args[0])
+            telegram_id = context.args[1]
+            
+            # Проверяем, что Telegram ID является числом
+            if not telegram_id.isdigit():
+                await update.message.reply_text("❌ Telegram ID должен быть числом.")
+                return
+            
+            # Проверяем, существует ли пользователь в Bitrix24
+            all_users = bitrix24_api.get_users()
+            bitrix_user = next((u for u in all_users if u.get("ID") == str(bitrix_user_id)), None)
+            
+            if not bitrix_user:
+                await update.message.reply_text(f"❌ Пользователь с Bitrix24 ID {bitrix_user_id} не найден.")
+                return
+            
+            # Проверяем, не связан ли уже этот Telegram ID с другим пользователем
+            existing_bitrix_id = telegram_bitrix_sync.get_bitrix_user_id(telegram_id)
+            if existing_bitrix_id and existing_bitrix_id != bitrix_user_id:
+                await update.message.reply_text(
+                    f"❌ Telegram ID {telegram_id} уже связан с Bitrix24 ID {existing_bitrix_id}.\n"
+                    "Сначала удалите существующую связь командой `/unlink_telegram`.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            # Выполняем связывание
+            success = telegram_bitrix_sync.add_telegram_link(bitrix_user_id, telegram_id)
+            
+            if success:
+                user_name = f"{bitrix_user.get('NAME', '')} {bitrix_user.get('LAST_NAME', '')}".strip()
+                user_position = bitrix_user.get('WORK_POSITION', '')
+                
+                await update.message.reply_text(
+                    f"✅ **Связывание выполнено успешно!**\n\n"
+                    f"👤 **Сотрудник:** {user_name}\n"
+                    f"💼 **Должность:** {user_position}\n"
+                    f"🆔 **Bitrix24 ID:** {bitrix_user_id}\n"
+                    f"📱 **Telegram ID:** `{telegram_id}`\n\n"
+                    f"🎯 **Теперь этот сотрудник:**\n"
+                    f"• Автоматически определяется как сотрудник\n"
+                    f"• Задачи назначаются на него при создании\n"
+                    f"• Не нужно добавлять в проекты вручную",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+                # Обновляем кеш
+                telegram_bitrix_sync.refresh_cache()
+                
+            else:
+                await update.message.reply_text("❌ Ошибка при связывании. Проверьте логи.")
+                
+        except ValueError:
+            await update.message.reply_text("❌ Bitrix24 ID должен быть числом.")
+        except Exception as e:
+            logger.error(f"Ошибка связывания: {e}")
+            await update.message.reply_text("❌ Произошла ошибка при связывании.")
+    
+    @admin_only
+    @log_user_action("unlink_telegram")
+    async def unlink_telegram_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Удаление связи Telegram ID с Bitrix24"""
+        if len(context.args) != 1:
+            await update.message.reply_text(
+                "❌ Неверный формат команды.\n"
+                "Используйте: `/unlink_telegram <Telegram_ID>`\n\n"
+                "Например: `/unlink_telegram 608167496`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        try:
+            telegram_id = context.args[0]
+            
+            # Проверяем, что связь существует
+            user_info = telegram_bitrix_sync.get_user_info(telegram_id)
+            if not user_info:
+                await update.message.reply_text(f"❌ Связь для Telegram ID {telegram_id} не найдена.")
+                return
+            
+            # Удаляем связь
+            success = telegram_bitrix_sync.remove_telegram_link(telegram_id)
+            
+            if success:
+                await update.message.reply_text(
+                    f"✅ **Связь удалена успешно!**\n\n"
+                    f"👤 **Сотрудник:** {user_info['name']}\n"
+                    f"🆔 **Bitrix24 ID:** {user_info['bitrix_id']}\n"
+                    f"📱 **Telegram ID:** `{telegram_id}`\n\n"
+                    f"⚠️ **Теперь этот пользователь:**\n"
+                    f"• Не определяется как сотрудник\n"
+                    f"• Задачи будут назначаться на ТехАккаунт",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+                # Обновляем кеш
+                telegram_bitrix_sync.refresh_cache()
+                
+            else:
+                await update.message.reply_text("❌ Ошибка при удалении связи. Проверьте логи.")
+                
+        except Exception as e:
+            logger.error(f"Ошибка удаления связи: {e}")
+            await update.message.reply_text("❌ Произошла ошибка при удалении связи.")
+    
+    @admin_only 
+    @log_user_action("show_links")
+    async def show_links_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать все текущие связи Telegram ID с Bitrix24"""
+        try:
+            # Получаем все связи
+            linked_users = telegram_bitrix_sync.get_all_linked_users()
+            
+            if not linked_users:
+                await update.message.reply_text("📱 Связанные Telegram аккаунты не найдены.")
+                return
+            
+            # Получаем информацию о пользователях из Bitrix24
+            all_bitrix_users = bitrix24_api.get_users()
+            
+            links_text = f"📱 **Связанные Telegram аккаунты** ({len(linked_users)})\n\n"
+            
+            for telegram_id, bitrix_id in linked_users.items():
+                # Ищем пользователя в Bitrix24
+                user_info = next((u for u in all_bitrix_users if u.get("ID") == str(bitrix_id)), None)
+                
+                if user_info:
+                    user_name = f"{user_info.get('NAME', '')} {user_info.get('LAST_NAME', '')}".strip()
+                    user_position = user_info.get('WORK_POSITION', '')
+                    active_status = "🟢 Активен" if user_info.get('ACTIVE') == 'Y' else "🔴 Неактивен"
+                    
+                    links_text += f"""
+👤 **{user_name}**
+💼 {user_position}
+🆔 Bitrix24: {bitrix_id}
+📱 Telegram: `{telegram_id}`
+📊 Статус: {active_status}
+
+"""
+                else:
+                    links_text += f"""
+❓ **Неизвестный пользователь**
+🆔 Bitrix24: {bitrix_id}
+📱 Telegram: `{telegram_id}`
+⚠️ Не найден в Bitrix24
+
+"""
+            
+            # Добавляем информацию о пользователях без связи
+            unlinked_users = telegram_bitrix_sync.get_unlinked_bitrix_users()
+            if unlinked_users:
+                links_text += f"\n🔍 **Пользователи без Telegram ID:** {len(unlinked_users)}\n"
+                links_text += "Используйте `/link_telegram` для связывания."
+            
+            await update.message.reply_text(links_text, parse_mode=ParseMode.MARKDOWN)
+            
+        except Exception as e:
+            logger.error(f"Ошибка показа связей: {e}")
+            await update.message.reply_text("❌ Ошибка при получении списка связей.")
+    
+    @admin_only
+    @log_user_action("sync_bitrix") 
+    async def sync_bitrix_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Синхронизация с Bitrix24 - обновление кеша и связей"""
+        try:
+            await update.message.reply_text("🔄 Начинаю синхронизацию с Bitrix24...")
+            
+            # Обновляем кеш связей
+            telegram_bitrix_sync.refresh_cache()
+            
+            # Синхронизируем с локальной БД
+            synced_count = telegram_bitrix_sync.sync_with_local_database()
+            
+            # Получаем статистику
+            linked_users = telegram_bitrix_sync.get_all_linked_users()
+            unlinked_users = telegram_bitrix_sync.get_unlinked_bitrix_users()
+            
+            await update.message.reply_text(
+                f"✅ **Синхронизация завершена!**\n\n"
+                f"📊 **Статистика:**\n"
+                f"🔗 Связанных пользователей: {len(linked_users)}\n"
+                f"❌ Без Telegram ID: {len(unlinked_users)}\n"
+                f"💾 Синхронизировано с локальной БД: {synced_count}\n\n"
+                f"💡 Используйте `/show_links` для просмотра всех связей.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка синхронизации с Bitrix24: {e}")
+            await update.message.reply_text("❌ Ошибка при синхронизации с Bitrix24.")
+    
     async def debug_all_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Отладочный обработчик всех сообщений"""
         message = update.message
@@ -2154,6 +2383,12 @@ class SupportBot:
         application.add_handler(CommandHandler("chat_employees", self.chat_employees_command), group=-1)
         application.add_handler(CommandHandler("manage_employees", self.manage_employees_command), group=-1)
         
+        # Команды управления связыванием tgID
+        application.add_handler(CommandHandler("link_telegram", self.link_telegram_command), group=-1)
+        application.add_handler(CommandHandler("unlink_telegram", self.unlink_telegram_command), group=-1)
+        application.add_handler(CommandHandler("show_links", self.show_links_command), group=-1)
+        application.add_handler(CommandHandler("sync_bitrix", self.sync_bitrix_command), group=-1)
+        
         # Обработка упоминаний в группах (средний приоритет)
         application.add_handler(MessageHandler(
             filters.TEXT & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP) & filters.Regex(r'@\w+'), 
@@ -2235,6 +2470,11 @@ class SupportBot:
         bot_info = await application.bot.get_me()
         self.bot_username = bot_info.username
         logger.info(f"Бот запущен: @{self.bot_username}")
+        
+        # Инициализация кеша связей Telegram-Bitrix24
+        logger.info("Инициализация кеша связей Telegram-Bitrix24...")
+        telegram_bitrix_sync.load_cache()
+        logger.info("Кеш связей загружен.")
 
 
 def create_bot_application() -> Application:
